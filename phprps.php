@@ -1,5 +1,8 @@
 <?php namespace phprps;
 
+class PHPRpsException extends \RuntimeException {
+}
+
 abstract class NamespacedRedis {
     protected $namespace;
     protected $redis;
@@ -32,23 +35,39 @@ abstract class NamespacedRedis {
     public function getRedis() {
         return $this->redis;
     }
+
+    public function ensureConnected() {
+        if (!$this->redis->isConnected()) {
+            throw new PHPRpsException("You cannot use the library if connection to the Redis failed.");
+        }
+    }
 }
 
 class PHPRps extends NamespacedRedis {
-    public function __construct($namespace, $redis_host="localhost", $redis_port=6379) {
+    public function __construct($namespace, $redis_host="localhost", $redis_port=6379, $redis_timeout=NULL) {
         $redis = new \Redis();
-        $redis->connect($redis_host, $redis_port);
+        try {
+            if (!$redis->connect($redis_host, $redis_port, is_null($redis_timeout)?0:$redis_timeout)) {
+                throw new PHPRpsException("Unable to connect to Redis server.");
+            }
+        } catch (\RedisException $e) {
+            throw new PHPRpsException("Unable to connect to Redis server.", 0, $e);
+        }
 
         parent::__construct($namespace, $redis);
     }
 
     public function subscribe($queue, $consumer_id) {
+        $this->ensureConnected();
+
         $this->redis->sAdd($this->_ns_subscriptions($queue), $consumer_id);
 
         return new Subscription($this, $queue, $consumer_id);
     }
 
     public function publish($queue, $message, $ttl=3600) {
+        $this->ensureConnected();
+
         $message_id = $this->redis->incr($this->_ns_nextid());
 
         $this->redis->setex($this->_ns_message($queue, $message_id), $ttl, $message);
@@ -74,10 +93,36 @@ class Subscription extends NamespacedRedis {
     }
 
     public function consume($block=true, $timeout=0) {
-        while (true) {
+        $this->ensureConnected();
+
+        $time_start = time();
+
+        while ($time_start + $timeout >= time()) {
             if ($block) {
-                $message_id = $this->redis->blpop($this->_ns_queue($this->queue, $this->consumer_id), $timeout);
-                $message_id = $message_id[1];
+                try {
+                    $oldTimeout = $this->redis->getTimeout();
+                    $this->redis->setOption(\Redis::OPT_READ_TIMEOUT, $timeout + 1);
+
+                    $message_id = $this->redis->blpop($this->_ns_queue($this->queue, $this->consumer_id), $timeout);
+
+                    $this->redis->setOption(\Redis::OPT_READ_TIMEOUT, $oldTimeout);
+
+                    if ($message_id) {
+                        $message_id = $message_id[1];
+                    } else {
+                        return NULL;
+                    }
+
+                    // Do not allow waiting more than specified timeout, if subsequent call to blpop is needed.
+                    $timeout -= (time() - $time_start);
+                    if ($timeout <= 0) {
+                        // Do not block at all, if timeout was already reached.
+                        $block = false;
+                    }
+                } catch (\RedisException $e) {
+                    // timeout
+                    return NULL;
+                }
             } else {
                 $message_id = $this->redis->lpop($this->_ns_queue($this->queue, $this->consumer_id));
 
@@ -88,15 +133,16 @@ class Subscription extends NamespacedRedis {
 
             $message = $this->redis->get($this->_ns_message($this->queue, $message_id));
 
-            if (!\is_null($message)) {
+            if (!\is_null($message) && $message !== false) {
                 return $message;
             }
         }
     }
 
     public function unsubscribe() {
+        $this->ensureConnected();
+
         $this->redis->srem($this->_ns_subscriptions($this->queue), $this->consumer_id);
         $this->redis->delete($this->_ns_queue($this->queue, $this->consumer_id));
     }
 }
-
